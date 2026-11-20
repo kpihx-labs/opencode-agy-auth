@@ -1,15 +1,18 @@
 /**
- * v2-clean.ts — V2-only, one account per provider, secrets owned by OpenCode.
+ * v2-clean.ts — V2-only Antigravity provider plugin.
  *
- * Design:
- *  - `options.ids` (default ["agy"]) drives N independent provider
- *    IDs, all served by this single plugin instance.
- *  - Each ID gets its own integration with one Google OAuth method. The
- *    credential is stored by OpenCode in SQLite — never in a plugin file.
- *  - The catalog is loaded BEFORE the synchronous transforms, then replayed via
- *    reload() whenever a credential changes. (V2 transforms must be sync.)
- *  - No `account/model` namespacing, no multi-account store, no failover.
- *  - Request shaping reuses the proven helpers in src/sdk + src/plugin.
+ * Invariants:
+ *  - `options.ids` (default ["agy"]) declares N independent accounts. Each
+ *    maps to one OpenCode integration + provider and one OAuth credential
+ *    stored by OpenCode — never in a plugin file.
+ *  - No account/model namespacing, no plugin-owned secret store, no failover.
+ *  - Catalogs come from each account's live quota, are loaded before the
+ *    synchronous transforms, and are replayed on credential changes.
+ *  - HTTP hooks are registered ONCE and are provider-agnostic: any request to
+ *    a Google Generative Language endpoint is rewritten to the Antigravity
+ *    internal endpoint. Legacy sessions (`google-agy`) and agent-level model
+ *    overrides are therefore covered without special cases.
+ *  - All request shaping lives in small pure helpers below, not inline patches.
  */
 import { spawn } from "node:child_process";
 
@@ -43,10 +46,10 @@ import { createAgyQuotaSummaryTool } from "./plugin/quota-summary";
 const DEFAULT_IDS = ["agy"];
 const DUMMY_KEY = "opencode-managed";
 const LOGIN_MODEL_ID = "__agy_login_required__";
-// Antigravity returns a misleading 429 "Resource has been exhausted" for an
-// oversized systemInstruction on an otherwise full-quota account. Verified
-// threshold: <=12000 chars -> 200, >=16000 chars -> 429. Stay well under it.
-const SYSTEM_INSTRUCTION_LIMIT = 10000;
+// Antigravity answers a misleading 429 "Resource has been exhausted" when an
+// injected systemInstruction exceeds roughly 12k characters. Keep the remote
+// instruction short and relocate the full text into a leading user message.
+const SYSTEM_CONTEXT_LIMIT = 10000;
 
 type AnyCtx = any;
 type OAuth = {
@@ -57,6 +60,10 @@ type OAuth = {
   expires: number;
 };
 
+function toOAuth(refresh: string, access: string, expires: number): OAuth {
+  return { type: "oauth", methodID: "oauth", refresh, access, expires };
+}
+
 function openBrowser(url: string): void {
   try {
     const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "rundll32" : "xdg-open";
@@ -64,12 +71,8 @@ function openBrowser(url: string): void {
     const child = spawn(command, args, { stdio: "ignore", detached: true });
     child.unref?.();
   } catch {
-    // Best-effort only; the URL is always shown in the instructions.
+    // Best effort: the URL is always shown in the OAuth instructions.
   }
-}
-
-function toOAuth(refresh: string, access: string, expires: number): OAuth {
-  return { type: "oauth", methodID: "oauth", refresh, access, expires };
 }
 
 function labelFor(id: string): string {
@@ -78,12 +81,63 @@ function labelFor(id: string): string {
   return suffix ? `AGY ${suffix}` : id;
 }
 
+/**
+ * Relocate an oversized injected systemInstruction into the contents array.
+ * Pure: takes and returns the parsed wrapped request body. Lossless.
+ */
+function relocateSystemContext(wrapped: AnyCtx, limit = SYSTEM_CONTEXT_LIMIT): AnyCtx {
+  if (!wrapped || typeof wrapped !== "object") return wrapped;
+  const req = wrapped.request;
+  if (!req || typeof req !== "object") return wrapped;
+  const parts: AnyCtx[] = Array.isArray(req.systemInstruction?.parts) ? req.systemInstruction.parts : [];
+  const sysText = parts.map((p) => (typeof p?.text === "string" ? p.text : "")).join("");
+  if (sysText.length <= limit) return wrapped;
+  req.systemInstruction = { parts: [{ text: sysText.slice(0, limit) }] };
+  const contents: AnyCtx[] = Array.isArray(req.contents) ? req.contents : [];
+  req.contents = [
+    { role: "user", parts: [{ text: `The following is authoritative system context (AGENTS.md):\n\n${sysText}` }] },
+    ...contents,
+  ];
+  return wrapped;
+}
+
+/**
+ * Resolve a display/tier model id to the canonical backend bucket id exposed
+ * by this account's live quota. Returns undefined when the base is unknown.
+ */
+function canonicalModel(requested: string, tierMap?: Record<string, Record<string, string>>): string | undefined {
+  if (!tierMap) return undefined;
+  const base = extractBaseModelId(requested);
+  const variants = tierMap[base];
+  if (!variants) return undefined;
+  return variants.tiered ?? variants.medium ?? variants.high ?? Object.values(variants)[0];
+}
+
+/**
+ * Decide which configured account owns a request. Uses the providerID as a
+ * hint (including the legacy `google-agy` alias), then catalog membership,
+ * then the first account. Never filters the request out.
+ */
+function selectAccount(
+  providerID: string | undefined,
+  requested: string,
+  ids: string[],
+  tiersById: Map<string, Record<string, Record<string, string>>>,
+): string {
+  if (providerID && ids.includes(providerID)) return providerID;
+  if (providerID === "google-agy" && ids.length) return ids[0] ?? "agy";
+  const base = extractBaseModelId(requested);
+  for (const id of ids) {
+    if (tiersById.get(id)?.[base]) return id;
+  }
+  return ids[0] ?? "agy";
+}
+
 export const setup = async (ctx: AnyCtx): Promise<() => void> => {
   const ids: string[] = Array.isArray(ctx.options?.ids) && ctx.options.ids.length
     ? ctx.options.ids
     : DEFAULT_IDS;
 
-  // Cached snapshot per provider, consumed by the synchronous transforms.
   const catalogs = new Map<string, AnyCtx[]>();
   const tiersById = new Map<string, Record<string, Record<string, string>>>();
   const connectionsById = new Map<string, AnyCtx>();
@@ -96,40 +150,43 @@ export const setup = async (ctx: AnyCtx): Promise<() => void> => {
       if (!connection) return undefined;
       connectionsById.set(id, connection);
       const resolved = await connApi.resolve(connection);
-      // V2 returns CredentialOAuth directly ({type:"oauth", access, refresh,
-      // expires}) — not a {type:"credential", credential:{...}} wrapper.
-      const oauth =
-        resolved?.type === "oauth" ? resolved : resolved?.credential?.type === "oauth" ? resolved.credential : undefined;
-      if (oauth?.access) {
-        // connection.resolve() returns the STORED credential verbatim. Because
-        // this provider declares a dummy apiKey, OpenCode never drives its own
-        // OAuth-refresh flow, so a stale access token stays stale (401 quota /
-        // "API key not valid"). Refresh it here, reusing the shared in-memory
-        // cache + in-flight dedup from the legacy path. Persistence back to the
-        // OpenCode store is best-effort via a no-op client; the in-memory cache
-        // keeps every subsequent call in this process on the fresh token.
-        let auth = resolveCachedAuth(
-          toOAuth(oauth.refresh, oauth.access, oauth.expires),
-        );
-        if (accessTokenExpired(auth)) {
-          const refreshed = await refreshAccessToken(auth, {
-            auth: { set: async () => {} },
-          } as AnyCtx);
-          if (refreshed?.access) {
-            auth = resolveCachedAuth(toOAuth(refreshed.refresh, refreshed.access, refreshed.expires));
-          }
+      const oauth = resolved?.type === "oauth" ? resolved : resolved?.credential?.type === "oauth" ? resolved.credential : undefined;
+      if (!oauth?.access) return undefined;
+
+      // connection.resolve() returns the stored credential verbatim. Because
+      // the provider declares a dummy apiKey, OpenCode never runs its own
+      // OAuth-refresh flow. Refresh on expiry through the shared in-memory
+      // cache + in-flight dedup, then normalize back to our OAuth shape.
+      let auth = resolveCachedAuth(toOAuth(oauth.refresh, oauth.access, oauth.expires));
+      if (accessTokenExpired(auth)) {
+        const refreshed = await refreshAccessToken(auth, { auth: { set: async () => {} } } as AnyCtx);
+        if (refreshed?.access) {
+          auth = resolveCachedAuth(toOAuth(refreshed.refresh, refreshed.access, refreshed.expires));
         }
-        return toOAuth(auth.refresh, auth.access, auth.expires);
       }
+      return toOAuth(auth.refresh, auth.access, auth.expires);
     } catch {
-      // No usable connection yet.
+      return undefined;
     }
-    return undefined;
   };
 
-  // OpenCode V2 Model.Info schema requires time.released, endpoint, options
-  // and cost as an ARRAY. Hand-built models missing these crash /api/model
-  // at `time.released` (verified via exa/web docs 2026-11-19).
+  const resolveProjectId = async (credential: OAuth): Promise<string> => {
+    const fromRefresh = parseRefreshParts(credential.refresh).projectId;
+    if (fromRefresh) return fromRefresh;
+    try {
+      const discovered = await resolveProjectContextFromAccessToken(
+        credential,
+        credential.access,
+        undefined,
+        undefined,
+        undefined,
+      );
+      return discovered?.effectiveProjectId || parseRefreshParts(discovered?.auth?.refresh || "").projectId || "antigravity";
+    } catch {
+      return "antigravity";
+    }
+  };
+
   const baseFields = (id: string, mid: string) => ({
     id: mid,
     modelID: mid,
@@ -147,7 +204,7 @@ export const setup = async (ctx: AnyCtx): Promise<() => void> => {
   const loginModel = (id: string, label: string): AnyCtx => ({
     ...baseFields(id, LOGIN_MODEL_ID),
     name: `Sign in to ${label} (Google OAuth)`,
-    description: "Run: opencode auth login " + id,
+    description: `Run: opencode auth login ${id}`,
     family: "unknown",
     capabilities: { tools: false, input: ["text"], output: ["text"] },
     limit: { context: 0, output: 0 },
@@ -182,34 +239,9 @@ export const setup = async (ctx: AnyCtx): Promise<() => void> => {
       catalogs.set(id, [loginModel(id, label)]);
       return;
     }
-    let projectId = parseRefreshParts(credential.refresh).projectId;
-    if (!projectId) {
-      // The refresh string does not always carry the project id. Resolve it
-      // from the live token exactly like request time does.
-      try {
-        const discovered = await resolveProjectContextFromAccessToken(
-          credential,
-          credential.access,
-          undefined,
-          undefined,
-          undefined,
-        );
-        projectId = discovered?.effectiveProjectId || parseRefreshParts(discovered?.auth?.refresh || "").projectId;
-      } catch {
-        // Fall through to login-required catalog.
-      }
-    }
-    if (!projectId) {
-      catalogs.set(id, [loginModel(id, label)]);
-      return;
-    }
+    const projectId = await resolveProjectId(credential);
     try {
-      const available = await fetchAvailableModelIds(
-        retrieveUserQuota,
-        credential.access,
-        projectId,
-        undefined,
-      );
+      const available = await fetchAvailableModelIds(retrieveUserQuota, credential.access, projectId, undefined);
       const tiers = buildTierMapping([...available]);
       if (Object.keys(tiers).length === 0) {
         catalogs.set(id, [loginModel(id, label)]);
@@ -222,13 +254,11 @@ export const setup = async (ctx: AnyCtx): Promise<() => void> => {
     }
   };
 
-  // Load external data BEFORE registering the synchronous transforms.
   await Promise.all(ids.map(loadCatalog));
 
   for (const id of ids) {
     const label = labelFor(id);
 
-    // 1. Provider declaration bound to the integration of the same id.
     ctx.provider?.transform?.((editor: AnyCtx) => {
       if (!editor) return;
       if (typeof editor.get === "function" && editor.get(id)) {
@@ -250,17 +280,11 @@ export const setup = async (ctx: AnyCtx): Promise<() => void> => {
             settings: { apiKey: DUMMY_KEY },
           },
           models: catalogs.get(id) || [],
-          // V2 excludes account-specific providers from the catalog unless the
-          // inventory is bound to the connection that produced it (sourceConnection).
           sourceConnection: connectionsById.get(id),
         });
       }
     });
 
-    // The kernel's own provider mirror uses ctx.model.transform + editor.update.
-    // editor.models.set on a config-declared provider is a no-op in this runtime
-    // (source stays null, modelCount 0), so publish each model through the
-    // proven path instead.
     ctx.model?.transform?.((editor: AnyCtx) => {
       if (!editor?.update) return;
       for (const model of catalogs.get(id) || []) {
@@ -270,7 +294,6 @@ export const setup = async (ctx: AnyCtx): Promise<() => void> => {
       }
     });
 
-    // 2. Integration with one OAuth method — OpenCode stores the credential.
     ctx.integration?.transform?.((editor: AnyCtx) => {
       if (!editor) return;
       editor.update?.(id, (i: AnyCtx) => { i.name = `${label} (Google OAuth)`; });
@@ -316,149 +339,95 @@ export const setup = async (ctx: AnyCtx): Promise<() => void> => {
             toOAuth(credential.refresh, credential.access, credential.expires),
             { auth: { set: async () => {} } } as AnyCtx,
           );
-          if (!next) throw new Error("AGY token refresh failed");
+          if (!next) throw new Error("Antigravity token refresh failed");
           return toOAuth(next.refresh, next.access, next.expires);
         },
       });
     });
-
-    // 3. Request interception via the V2 http.request/http.response hooks.
-    // aisdk.hook never fires for the native google provider; session hooks do.
-    ctx.session?.hook?.("http.request", async (event: AnyCtx) => {
-      if (!event?.request) return;
-      const rawUrl: string = event.request.url || "";
-      const isGL = isGenerativeLanguageRequest(rawUrl);
-      const isInternal = rawUrl.includes("cloudcode-pa.googleapis.com");
-      if (!isGL && !isInternal) return;
-
-      const credential = await resolveCredential(id);
-      if (!credential?.access) return;
-
-      let projectId = parseRefreshParts(credential.refresh).projectId;
-      if (!projectId) {
-        try {
-          const discovered = await resolveProjectContextFromAccessToken(
-            credential,
-            credential.access,
-            undefined,
-            undefined,
-            undefined,
-          );
-          projectId = discovered?.effectiveProjectId;
-        } catch {
-          // Fall back below.
-        }
-      }
-      projectId = projectId || "antigravity";
-
-      let requestUrl = rawUrl;
-      const requested = parseGenerativeLanguageRequest(rawUrl)?.effectiveModel;
-      if (requested) {
-        const resolved = resolveModelTier(requested, { headers: event.request.headers }, tiersById.get(id));
-        if (resolved !== requested) {
-          requestUrl = toUrlString(rewriteRequestedModelInInput(requestUrl, requested, resolved));
-        }
-      }
-
-      const modelEnums = await getModelEnums(credential.access, projectId, requested).catch(() => undefined);
-      const body = typeof event.request.clone === "function"
-        ? await event.request.clone().text().catch(() => undefined)
-        : undefined;
-      const transformed = prepareAgyRequest(
-        requestUrl,
-        {
-          method: event.request.method,
-          headers: event.request.headers,
-          body,
-        },
-        credential.access,
-        projectId,
-        undefined,
-        modelEnums,
-      );
-
-      // The AI SDK opens the request with the catalog's display model id
-      // (e.g. `gemini-3.8-flash`) and prepareAgyRequest derives a variant
-      // (`gemini-3.8-flash-medium`) from modelEnums. The Antigravity backend
-      // only accepts the canonical bucket id (`gemini-3.8-flash-tiered`);
-      // anything else answers 404/429 "Resource has been exhausted" even with
-      // full quota. Force the wrapped body's `model` to a real bucket id built
-      // from the live quota, matching by base name, tiered variant preferred.
-      let outBody = transformed.init.body;
-      try {
-        const wrapped = JSON.parse(String(outBody));
-        // (1) Force the wrapped `model` to a canonical id that actually exists
-        // in the live-quota bucket set. The catalog's display names (and the
-        // variant derived by prepareAgyRequest from modelEnums, e.g.
-        // `gemini-3.8-flash-medium`) are rejected by the backend with 404/429.
-        const currentModel: string = String(wrapped?.model ?? requested ?? "");
-        const base = extractBaseModelId(currentModel);
-        const tierMap = tiersById.get(id)?.[base];
-        const canonical = tierMap
-          ? (tierMap["tiered"] ?? tierMap["medium"] ?? tierMap["high"] ?? Object.values(tierMap)[0])
-          : undefined;
-        if (canonical && canonical !== currentModel) {
-          wrapped.model = canonical;
-        }
-
-        // (2) Antigravity rejects an oversized `systemInstruction` (>~12k
-        // chars) with a misleading 429 "Resource has been exhausted" even on
-        // a full-quota account. OpenCode injects the whole AGENTS.md kernel
-        // there. Relocate the full text into a leading user content part and
-        // keep a short systemInstruction — lossless, no kernel content lost.
-        const req = wrapped?.request;
-        const parts: AnyCtx[] = Array.isArray(req?.systemInstruction?.parts) ? req.systemInstruction.parts : [];
-        const sysText = parts.map((p) => (typeof p?.text === "string" ? p.text : "")).join("");
-        if (sysText.length > SYSTEM_INSTRUCTION_LIMIT) {
-          req.systemInstruction = { parts: [{ text: sysText.slice(0, SYSTEM_INSTRUCTION_LIMIT) }] };
-          const contents: AnyCtx[] = Array.isArray(req.contents) ? req.contents : [];
-          req.contents = [
-            {
-              role: "user",
-              parts: [{ text: `The following is authoritative system context (AGENTS.md):\n\n${sysText}` }],
-            },
-            ...contents,
-          ];
-        }
-        outBody = JSON.stringify(wrapped);
-      } catch {
-        // If the body is not parseable JSON, forward it untouched.
-      }
-      const headers = new Headers(transformed.init.headers);
-      headers.delete("x-goog-api-key");
-      headers.delete("x-api-key");
-      headers.set("Authorization", `Bearer ${credential.access}`);
-      if (!headers.has("User-Agent")) {
-        headers.set("User-Agent", buildAgyCliUserAgent(requested));
-      }
-      event.request = new Request(toUrlString(transformed.request), {
-        method: transformed.init.method || event.request.method,
-        headers,
-        body: outBody,
-      });
-    }, { providerID: id });
-
-    ctx.session?.hook?.("http.response", async (event: AnyCtx) => {
-      if (!event?.response || !(event.response instanceof Response)) return;
-      const rawUrl: string = event.request?.url || "";
-      if (!rawUrl.includes("cloudcode-pa.googleapis.com")) return;
-      const isStreaming = rawUrl.includes(":streamGenerateContent") ||
-        event.response.headers.get("content-type")?.includes("text/event-stream");
-      const parsedModel = parseGenerativeLanguageRequest(rawUrl)?.effectiveModel;
-      event.response = await transformAgyResponse(
-        event.response,
-        Boolean(isStreaming),
-        null,
-        parsedModel,
-        undefined,
-        undefined,
-      );
-    }, { providerID: id });
   }
 
-  // Agent-callable quota tool + slash command, restored from the legacy V2
-  // plugin. Register once per configured id so each account's quota is
-  // reachable; tool names are derived from the id (no hardcoded account data).
+  // One global request hook, provider-agnostic. The only gate is the target
+  // URL shape, so any session/agent/provider referencing a Google Generative
+  // Language model is routed through Antigravity — including legacy sessions
+  // whose stored providerID is `google-agy`.
+  ctx.session?.hook?.("http.request", async (event: AnyCtx) => {
+    if (!event?.request) return;
+    const rawUrl: string = event.request.url || "";
+    if (!isGenerativeLanguageRequest(rawUrl)) return;
+
+    const requested = parseGenerativeLanguageRequest(rawUrl)?.effectiveModel;
+    if (!requested) return;
+
+    const id = selectAccount(event.providerID, requested, ids, tiersById);
+    const credential = await resolveCredential(id);
+    if (!credential?.access) return;
+    const projectId = await resolveProjectId(credential);
+
+    const tiers = tiersById.get(id);
+    const canonical = canonicalModel(requested, tiers) ?? resolveModelTier(requested, { headers: event.request.headers }, tiers);
+    const requestUrl = canonical && canonical !== requested
+      ? toUrlString(rewriteRequestedModelInInput(rawUrl, requested, canonical))
+      : rawUrl;
+
+    const modelEnums = await getModelEnums(credential.access, projectId, canonical).catch(() => undefined);
+    const body = typeof event.request.clone === "function"
+      ? await event.request.clone().text().catch(() => undefined)
+      : undefined;
+    const transformed = prepareAgyRequest(
+      requestUrl,
+      { method: event.request.method, headers: event.request.headers, body },
+      credential.access,
+      projectId,
+      undefined,
+      modelEnums,
+    );
+
+    let wrapped: AnyCtx;
+    try {
+      wrapped = JSON.parse(String(transformed.init.body));
+    } catch {
+      wrapped = undefined;
+    }
+    if (wrapped) {
+      // Guarantee the backend-facing id is a real quota bucket id. The AI SDK
+      // may emit a display/variant id even after the URL rewrite.
+      if (canonical && typeof wrapped.model === "string") wrapped.model = canonical;
+      wrapped = relocateSystemContext(wrapped);
+    }
+    const outBody = wrapped ? JSON.stringify(wrapped) : transformed.init.body;
+
+    const headers = new Headers(transformed.init.headers);
+    headers.delete("x-goog-api-key");
+    headers.delete("x-api-key");
+    headers.set("Authorization", `Bearer ${credential.access}`);
+    if (!headers.has("User-Agent")) headers.set("User-Agent", buildAgyCliUserAgent(requested));
+    event.request = new Request(toUrlString(transformed.request), {
+      method: transformed.init.method || event.request.method,
+      headers,
+      body: outBody,
+    });
+  });
+
+  // One global response hook. It transforms any Antigravity internal response
+  // back into the shape the AI SDK expects.
+  ctx.session?.hook?.("http.response", async (event: AnyCtx) => {
+    if (!event?.response || !(event.response instanceof Response)) return;
+    const rawUrl: string = event.request?.url || "";
+    if (!rawUrl.includes("cloudcode-pa.googleapis.com")) return;
+    const isStreaming = rawUrl.includes(":streamGenerateContent") ||
+      event.response.headers.get("content-type")?.includes("text/event-stream");
+    const parsedModel = parseGenerativeLanguageRequest(rawUrl)?.effectiveModel;
+    event.response = await transformAgyResponse(
+      event.response,
+      Boolean(isStreaming),
+      null,
+      parsedModel,
+      undefined,
+      undefined,
+    );
+  });
+
+  // Agent-callable quota tools + slash commands, one pair per account.
   const noopClient = { auth: { set: async () => {} } } as AnyCtx;
   ctx.tool?.transform?.((editor: AnyCtx) => {
     if (!editor) return;
@@ -542,8 +511,6 @@ export const setup = async (ctx: AnyCtx): Promise<() => void> => {
     }
   });
 
-  // Rebuild the cached catalog when a credential appears or changes, then replay
-  // the synchronous transforms through reload().
   const controller = new AbortController();
   void (async () => {
     try {
