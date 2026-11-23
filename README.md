@@ -1,5 +1,15 @@
 # OpenCode Antigravity CLI Auth Plugin
 
+> [!IMPORTANT]
+> **KπX fork (`@kpihx-labs/opencode-agy-auth`, V2).** This fork is loaded as a local `file://` plugin
+> from the sovereign kernel, declares N accounts via `options.ids`, and keeps all OAuth credentials
+> in OpenCode's own store. **See [INSTALL.md](./INSTALL.md) for the canonical install/config/auth
+> procedure** — the upstream instructions below (npm install, `google-agy` provider, `projectId`)
+> describe the original upstream package and are kept for reference only.
+>
+> **Agent compatibility:** use KπX custom agents (`Live`, `Colab`, …). OpenCode built-in agents
+> (`build`, `plan`, `general`) are not supported — see [INSTALL.md](./INSTALL.md#agent-compatibility-important).
+
 [![npm version](https://img.shields.io/npm/v/@anthonyhaussman/opencode-agy-auth)](https://www.npmjs.com/package/@anthonyhaussman/opencode-agy-auth)
 [![npm downloads](https://img.shields.io/npm/dw/@anthonyhaussman/opencode-agy-auth)](https://www.npmjs.com/package/@anthonyhaussman/opencode-agy-auth)
 [![CI](https://github.com/anthonyhaussman/opencode-agy-auth/actions/workflows/ci.yml/badge.svg)](https://github.com/anthonyhaussman/opencode-agy-auth/actions/workflows/ci.yml)
