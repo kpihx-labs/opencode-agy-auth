@@ -16,13 +16,16 @@ export interface AccountStore {
 }
 
 const FALLBACK_ACCOUNT = 'default';
+// Generic key for a leftover `google` OAuth credential imported as a secondary
+// account. Never a personal name: the key must be portable across users.
+const IMPORTED_GOOGLE_ACCOUNT = 'google-import';
 
 /**
  * Source of truth for accounts, OWNED BY THE PLUGIN.
  *
  * `auth.json` cannot hold this: OpenCode itself writes the `google-agy` entry
  * as a flat OAuth record when it refreshes a token, which silently deletes any
- * nested `accounts` map (verified: kpihx/demar disappeared after one run).
+ * nested `accounts` map (verified: named accounts disappeared after one run).
  * So accounts live here, and `auth.json` is kept only as a flat mirror for
  * OpenCode's own auth detection.
  */
@@ -70,9 +73,12 @@ function writeAccountsFile(store: AccountStore): void {
  * One-time bootstrap when no accounts file exists yet.
  *
  * Rebuilds named accounts from what is available on disk: the flat/nested
- * `google-agy` entry becomes `kpihx`, and a distinct `google` OAuth record (a
- * leftover Antigravity login, different refresh token) becomes `demar`.
- * No secret is printed, and nothing is invented: only tokens already present.
+ * `google-agy` entry keeps its stored key (the generic `default` produced by
+ * normalizeAccountStore for a flat record), and a distinct `google` OAuth
+ * record (a leftover Antigravity login, different refresh token) is imported
+ * as `google-import`. Existing stored keys are preserved verbatim so live
+ * user credentials keep working. No secret is printed, and nothing is
+ * invented: only tokens already present.
  */
 function bootstrapAccounts(entry: any): AccountStore {
   const store = normalizeAccountStore(entry);
@@ -85,9 +91,11 @@ function bootstrapAccounts(entry: any): AccountStore {
   let activeAccount: string | undefined;
 
   if (names.length === 1) {
-    const only = store.accounts[names[0] as string];
-    accounts.kpihx = only;
-    activeAccount = 'kpihx';
+    // Keep the key that is already on disk (the generic `default` for a flat
+    // record, or a name the user chose) so their live credentials still load.
+    const onlyName = names[0] as string;
+    accounts[onlyName] = store.accounts[onlyName];
+    activeAccount = store.activeAccount ?? onlyName;
   } else {
     for (const name of names) {
       accounts[name] = store.accounts[name];
@@ -104,9 +112,9 @@ function bootstrapAccounts(entry: any): AccountStore {
     typeof secondary.refresh === 'string' &&
     secondary.refresh &&
     secondary.refresh !== primary?.refresh &&
-    !accounts.demar
+    !accounts[IMPORTED_GOOGLE_ACCOUNT]
   ) {
-    accounts.demar = {
+    accounts[IMPORTED_GOOGLE_ACCOUNT] = {
       type: 'oauth',
       access: secondary.access ?? '',
       refresh: secondary.refresh,
@@ -445,8 +453,8 @@ export function syncAccountStore(): boolean {
  *
  * NEVER copies credentials from another account: two names sharing one token is
  * indistinguishable from a real second account until the quota contradicts it
- * (that exact trap cost a debugging session — a `demar` entry cloned from
- * `kpihx` silently spent kpihx's exhausted quota under a different label).
+ * (a stale duplicate silently spends the original's exhausted quota under a
+ * different label).
  *
  * The entry is a STUB (`needsCredentials: true`): fill `refresh` (and
  * optionally `access`/`expires`) by editing the JSON directly. Idempotent.
